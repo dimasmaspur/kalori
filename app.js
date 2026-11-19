@@ -901,7 +901,7 @@ async function handlePhoto(file) {
 
 /* ============ main render ============ */
 const TABS = [
-  { id: 'today', label: 'Hari ini', icon: 'plate', title: 'Kalori' },
+  { id: 'today', label: 'Hari ini', icon: 'plate', title: 'Kaloree' },
   { id: 'progress', label: 'Progres', icon: 'chart', title: 'Progres' },
   { id: 'profile', label: 'Atur', icon: 'sliders', title: 'Pengaturan' },
 ];

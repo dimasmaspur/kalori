@@ -1,6 +1,6 @@
 {
-  "name": "Kalori",
-  "short_name": "Kalori",
+  "name": "Kaloree",
+  "short_name": "Kaloree",
   "description": "Catat kalori harian dengan foto + AI",
   "start_url": "./",
   "scope": "./",

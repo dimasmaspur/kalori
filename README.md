@@ -1,4 +1,4 @@
-# Kalori
+# Kaloree
 
 PWA pribadi untuk catat kalori: foto/teks → Gemini → kkal & makro. Data tersimpan di HP (localStorage), tanpa server.
 
