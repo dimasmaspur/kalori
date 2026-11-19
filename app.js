@@ -140,8 +140,10 @@ async function listModels(key) {
 
 function pickDefaultModel(names) {
   const ver = (n) => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
-  const flash = names.filter((n) => /-flash$/.test(n) || /-flash-latest$/.test(n));
-  const pool = flash.length ? flash : names;
+  // stable (non-preview) flash first: preview/newest models often have tiny free-tier quotas
+  const flash = names.filter((n) => /-flash$/.test(n));
+  const pool = flash.length ? flash : names.filter((n) => /flash/.test(n) && !/lite/.test(n)).length
+    ? names.filter((n) => /flash/.test(n) && !/lite/.test(n)) : names;
   return pool.sort((a, b) => ver(b) - ver(a) || a.length - b.length)[0] || 'gemini-2.5-flash';
 }
 
@@ -154,25 +156,73 @@ async function ensureModel() {
   return state.settings.model;
 }
 
+// Order of models to try when the current one hits its quota: other flash models
+// (newest first), then flash-lite (usually the most generous free tier).
+function fallbackModels(current, names) {
+  const ver = (n) => parseFloat((n.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+  const pre = (n) => (/preview/.test(n) ? 1 : 0);
+  const byVer = (a, b) => pre(a) - pre(b) || ver(b) - ver(a) || a.length - b.length;
+  const ok = (n) => !/(exp|pro)/.test(n);
+  const flash = names.filter((n) => ok(n) && /flash/.test(n) && !/lite/.test(n)).sort(byVer);
+  const lite = names.filter((n) => ok(n) && /flash-lite/.test(n)).sort(byVer);
+  const extra = ['gemini-2.5-flash', 'gemini-2.5-flash-lite'];
+  return [...new Set([current, ...flash, ...lite, ...extra])].filter(Boolean);
+}
+
+function quotaKind(err) {
+  const s = JSON.stringify(err?.details || '') + (err?.message || '');
+  if (/PerDay|per_day|daily/i.test(s)) return 'day';
+  if (/PerMinute|per_minute/i.test(s)) return 'minute';
+  return '';
+}
+
+async function callModel(model, key, body) {
+  const res = await fetch(`${API}/models/${encodeURIComponent(model)}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+    body,
+  });
+  const j = await res.json().catch(() => ({}));
+  return { res, j };
+}
+
 async function analyze({ b64, text }) {
   const key = state.settings.apiKey;
   if (!key) throw new Error('API key Gemini belum diisi (tab Pengaturan).');
   const model = await ensureModel();
   const parts = [{ text: PROMPT + (text ? `\n\nKeterangan dari user: ${text}` : '') }];
   if (b64) parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
-  const res = await fetch(`${API}/models/${encodeURIComponent(model)}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts }],
-      generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA, temperature: 0.2 },
-    }),
+  const body = JSON.stringify({
+    contents: [{ role: 'user', parts }],
+    generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA, temperature: 0.2 },
   });
-  const j = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = j.error?.message || `HTTP ${res.status}`;
-    if (res.status === 429) throw new Error('Kuota Gemini habis/terlalu cepat. Coba lagi sebentar. (' + msg + ')');
-    throw new Error(msg);
+
+  if (!state.models) { try { state.models = await listModels(key); } catch { state.models = []; } }
+  const candidates = fallbackModels(model, state.models);
+  let j, lastErr = null, minuteOnly = true;
+  for (const m of candidates) {
+    const r = await callModel(m, key, body);
+    j = r.j;
+    if (r.res.ok) {
+      if (m !== state.settings.model) {
+        state.settings.model = m; store.set('settings', state.settings);
+        toast(`Kuota model lama habis → pindah ke ${m}`, 3500);
+      }
+      lastErr = null;
+      break;
+    }
+    lastErr = { status: r.res.status, msg: j.error?.message || `HTTP ${r.res.status}`, kind: quotaKind(j.error) };
+    // only fall through to another model on quota / model-unavailable errors
+    if (![429, 404].includes(r.res.status) && !/not (found|supported)|free tier|quota/i.test(lastErr.msg)) break;
+    if (lastErr.kind !== 'minute') minuteOnly = false;
+  }
+  if (lastErr) {
+    if (lastErr.status === 429) {
+      throw new Error(minuteOnly
+        ? 'Terlalu cepat — batas per menit Gemini. Tunggu ±1 menit lalu coba lagi.'
+        : 'Kuota harian free tier semua model habis. Coba lagi besok, atau aktifkan billing di AI Studio.');
+    }
+    throw new Error(lastErr.msg);
   }
   const txt = (j.candidates?.[0]?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
   if (!txt) throw new Error('AI tidak memberi jawaban' + (j.promptFeedback?.blockReason ? ` (${j.promptFeedback.blockReason})` : '.'));
