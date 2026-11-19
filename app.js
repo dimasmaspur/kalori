@@ -293,29 +293,48 @@ function quotaKind(err) {
   return '';
 }
 
-async function callModel(model, key, body) {
-  const res = await fetch(`${API}/models/${encodeURIComponent(model)}:generateContent`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-    body,
-  });
-  const j = await res.json().catch(() => ({}));
-  return { res, j };
+// "Low thinking" per model family: Gemini 3+ takes thinkingLevel, 2.5 takes a token
+// budget (thinkingLevel there is a 400). 2.5 Flash-Lite doesn't think by default.
+function thinkingFor(model, level) {
+  if (!level) return null;
+  const v = parseFloat((model.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1] || 0);
+  if (v >= 3) return { thinkingLevel: level };
+  if (v >= 2.5 && !/lite/.test(model)) return { thinkingBudget: level === 'low' ? 512 : -1 };
+  return null;
+}
+
+async function callModel(model, key, payload, thinking) {
+  const send = async (withThinking) => {
+    const tc = withThinking ? thinkingFor(model, thinking) : null;
+    const body = { ...payload, generationConfig: { ...payload.generationConfig, ...(tc ? { thinkingConfig: tc } : {}) } };
+    const res = await fetch(`${API}/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify(body),
+    });
+    const j = await res.json().catch(() => ({}));
+    return { res, j, tc };
+  };
+  let r = await send(true);
+  // model rejected our thinking setting → retry once with its default
+  if (r.tc && r.res.status === 400 && /thinking/i.test(r.j.error?.message || '')) r = await send(false);
+  return r;
 }
 
 // Generic structured call with automatic model fallback on quota errors.
-async function gemini(parts, schema, temperature = 0.2) {
+// thinking: 'low' to save tokens on simple tasks, null = model default.
+async function gemini(parts, schema, temperature = 0.2, thinking = null) {
   const key = state.settings.apiKey;
   if (!key) throw new Error('API key Gemini belum diisi (tab Pengaturan).');
   const model = await ensureModel();
-  const body = JSON.stringify({
+  const payload = {
     contents: [{ role: 'user', parts }],
     generationConfig: { responseMimeType: 'application/json', responseSchema: schema, temperature },
-  });
+  };
   if (!state.models) { try { state.models = await listModels(key); } catch { state.models = []; } }
   let j, lastErr = null, minuteOnly = true;
   for (const m of fallbackModels(model, state.models)) {
-    const r = await callModel(m, key, body);
+    const r = await callModel(m, key, payload, thinking);
     j = r.j;
     if (r.res.ok) {
       if (m !== state.settings.model) {
@@ -345,7 +364,7 @@ async function gemini(parts, schema, temperature = 0.2) {
 async function analyze({ b64, text }) {
   const parts = [{ text: PROMPT + (text ? `\n\nKeterangan dari user: ${text}` : '') }];
   if (b64) parts.push({ inline_data: { mime_type: 'image/jpeg', data: b64 } });
-  const out = await gemini(parts, SCHEMA);
+  const out = await gemini(parts, SCHEMA, 0.2, 'low');
   return {
     note: out.note || '',
     items: (out.items || []).map((i) => ({
